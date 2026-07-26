@@ -1,0 +1,9 @@
+build/
+*.vpk
+*.velf
+*.self
+
+# local test data: savegames pulled off the console
+repro-save/
+
+.DS_Store
