@@ -47,6 +47,7 @@ static void nullzone_patches(void);
 static void checkpoint_patches(void);
 static void hud_patches(void);
 static void exit_patches(void);
+static void buyfull_patches(void);
 
 void __kuser_memory_barrier(void) {
 	__sync_synchronize();
@@ -89,6 +90,7 @@ void so_patch(void) {
 	checkpoint_patches();
 	hud_patches();
 	exit_patches();
+	buyfull_patches();
 }
 
 /* ------------------------------------------------------------------------- *
@@ -546,4 +548,68 @@ static void exit_patches(void) {
 		hook_addr(ne, (uintptr_t)&native_exit);
 	else
 		l_error("nativeExit not found");
+}
+
+/* ------------------------------------------------------------------------- *
+ * "Get the full version" buttons
+ *
+ * The menu movies still carry the upsell button from the lite build
+ * (btn_lok_buyfull in the main menu, widgetBuyFull in the pause menu). Nothing
+ * in the code ever sets its text or hides it, so it shows up with the
+ * placeholder the artists left in the movie -- in Italian -- and sits on top of
+ * the Options entry. Hide it whenever one of those menus gets focus.
+ * ------------------------------------------------------------------------- */
+static so_hook main_menu_focus_hook, first_time_focus_hook, igm_focus_hook;
+static void *(*flash_manager_instance)(void) = NULL;
+static void (*rfx_set_visible)(void *, const char *, int) = NULL;
+static void (*rfx_set_enabled)(void *, const char *, int) = NULL;
+
+static void hide_buyfull(void) {
+	static const char *names[] = {
+		"btn_lok_buyfull", "btn_lok_buyfull_first", "widgetBuyFull",
+	};
+	void *fm = flash_manager_instance();
+	void *rfx = fm ? *(void **)((char *)fm + 8) : NULL;  // FlashManager's RenderFX
+	if (!rfx) return;
+	for (int i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++) {
+		rfx_set_enabled(rfx, names[i], 0);
+		rfx_set_visible(rfx, names[i], 0);
+	}
+}
+
+static void main_menu_focus(void *self) {
+	SO_CONTINUE(int, main_menu_focus_hook, self);
+	hide_buyfull();
+}
+
+static void first_time_focus(void *self) {
+	SO_CONTINUE(int, first_time_focus_hook, self);
+	hide_buyfull();
+}
+
+static void igm_focus(void *self) {
+	SO_CONTINUE(int, igm_focus_hook, self);
+	hide_buyfull();
+}
+
+static void buyfull_patches(void) {
+	flash_manager_instance = (void *)so_symbol(&so_mod, "_ZN12FlashManager11GetInstanceEv");
+	rfx_set_visible = (void *)so_symbol(&so_mod, "_ZN8RenderFX10SetVisibleEPKcb");
+	rfx_set_enabled = (void *)so_symbol(&so_mod, "_ZN8RenderFX10SetEnabledEPKcb");
+	if (!flash_manager_instance || !rfx_set_visible || !rfx_set_enabled) {
+		l_error("buyfull: FlashManager/RenderFX symbols not found");
+		return;
+	}
+
+	uintptr_t mm = (uintptr_t)so_symbol(&so_mod, "_ZN5Menus13MainMenuState8GotFocusEv");
+	if (mm)
+		main_menu_focus_hook = hook_addr(mm, (uintptr_t)&main_menu_focus);
+
+	uintptr_t ft = (uintptr_t)so_symbol(&so_mod, "_ZN5Menus22MainMenuFirstTimeState8GotFocusEv");
+	if (ft)
+		first_time_focus_hook = hook_addr(ft, (uintptr_t)&first_time_focus);
+
+	uintptr_t igm = (uintptr_t)so_symbol(&so_mod, "_ZN5Menus15InGameMenuState8GotFocusEv");
+	if (igm)
+		igm_focus_hook = hook_addr(igm, (uintptr_t)&igm_focus);
 }
