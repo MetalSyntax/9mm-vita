@@ -37,6 +37,11 @@ extern "C"
 // uses 0xFA0/0xFC0; everything below 0xF00 is ours.
 #define CAVE_BASE 0x9A000200
 
+// Trampolines for swp_patches(), one per site, above the ones in CAVE_BASE.
+#define SWP_CAVE_BASE 0x9A000400
+#define SWP_CAVE_END  0x9A000F00
+
+static void swp_patches(void);
 static void savegame_patches(void);
 static void nullzone_patches(void);
 static void checkpoint_patches(void);
@@ -78,6 +83,7 @@ void kuser_patch(void) {
 
 void so_patch(void) {
 	kuser_patch();
+	swp_patches();
 	savegame_patches();
 	nullzone_patches();
 	checkpoint_patches();
@@ -153,6 +159,96 @@ static void null_guard(const char *name, const char *symbol, uint32_t at_off,
 	uint32_t br = arm_branch(at, cave, B_AL);
 	kuKernelCpuUnrestrictedMemcpy((void *)at, &br, 4);
 	l_debug("patched %s @ %p", name, (void *)at);
+}
+
+/* ------------------------------------------------------------------------- *
+ * SWP
+ *
+ * glitch::io::CMemoryReadFile guards the refcount of its shared buffer with a
+ * spinlock built on SWP (ctor, dtor and clone). SWP is deprecated on ARMv7 and
+ * the Vita doesn't enable it, so the first memory file that shares its buffer
+ * dies with an undefined instruction exception.
+ *
+ * Each one is sent to a trampoline doing the same swap with LDREX/STREX:
+ *
+ *      push  {a, b, c}
+ *      mrs   b, APSR
+ *      dmb   ish
+ *   1: ldrex c, [Rn]
+ *      strex a, Rt2, [Rn]
+ *      cmp   a, #0
+ *      bne   1b
+ *      dmb   ish
+ *      msr   APSR_nzcvq, b
+ *      mov   Rt, c
+ *      pop   {a, b, c}
+ *      b     next_instruction
+ *
+ * Going through c keeps swp Rt, Rt, [Rn] correct. Every SWP in the game is a
+ * spinlock test followed by a cmp on Rt; requiring that keeps us from rewriting
+ * a literal pool word that happens to decode as one.
+ * ------------------------------------------------------------------------- */
+static void swp_patches(void) {
+	uintptr_t cave = SWP_CAVE_BASE;
+	int count = 0;
+
+	for (uintptr_t addr = so_mod.text_base; addr + 4 < so_mod.text_base + so_mod.text_size; addr += 4) {
+		uint32_t insn = *(uint32_t *)addr;
+		if ((insn & 0x0FB00FF0) != 0x01000090)
+			continue;
+
+		uint32_t cond = insn & 0xF0000000;
+		uint32_t byte = insn & 0x00400000;
+		uint32_t rn  = (insn >> 16) & 0xF;
+		uint32_t rt  = (insn >> 12) & 0xF;
+		uint32_t rt2 = insn & 0xF;
+
+		uint32_t next = *(uint32_t *)(addr + 4);
+		// cmp Rt, #imm or cmp Rt, Rm
+		if (cond == 0xF0000000 || (next & 0x0DFF0000) != (0x01500000 | (rt << 16)))
+			continue;
+		if (rn >= 13 || rt >= 13 || rt2 >= 13) {
+			l_error("swp_patches: unhandled SWP %08X at %p", insn, (void *)addr);
+			continue;
+		}
+		if (cave + 12 * 4 > SWP_CAVE_END)
+			fatal_error("Too many SWP instructions to patch (%d).", count);
+
+		uint32_t scratch[3], n = 0;
+		for (uint32_t r = 0; n < 3; r++)
+			if (r != rn && r != rt && r != rt2)
+				scratch[n++] = r;
+		uint32_t a = scratch[0], b = scratch[1], c = scratch[2];
+		uint32_t regs = (1 << a) | (1 << b) | (1 << c);
+
+		uint32_t tramp[12] = {
+			0xE92D0000 | regs,                                       // push {a, b, c}
+			0xE10F0000 | (b << 12),                                  // mrs b, APSR
+			0xF57FF05B,                                              // dmb ish
+			(byte ? 0xE1D00F9F : 0xE1900F9F) | (rn << 16) | (c << 12), // ldrex(b) c, [Rn]
+			(byte ? 0xE1C00F90 : 0xE1800F90) | (rn << 16) | (a << 12) | rt2, // strex(b) a, Rt2, [Rn]
+			0xE3500000 | (a << 16),                                  // cmp a, #0
+			0,                                                       // bne ldrex
+			0xF57FF05B,                                              // dmb ish
+			0xE128F000 | b,                                          // msr APSR_nzcvq, b
+			0xE1A00000 | (rt << 12) | c,                             // mov Rt, c
+			0xE8BD0000 | regs,                                       // pop {a, b, c}
+			0,                                                       // b next
+		};
+		tramp[6]  = arm_branch(cave + 6 * 4, cave + 3 * 4, 0x1A000000);
+		tramp[11] = arm_branch(cave + 11 * 4, addr + 4, B_AL);
+		kuKernelCpuUnrestrictedMemcpy((void *)cave, tramp, sizeof(tramp));
+		kuKernelFlushCaches((void *)cave, sizeof(tramp));
+
+		// Same condition as the SWP, so a skipped one stays skipped.
+		uint32_t br = arm_branch(addr, cave, cond | 0x0A000000);
+		kuKernelCpuUnrestrictedMemcpy((void *)addr, &br, 4);
+
+		cave += sizeof(tramp);
+		count++;
+	}
+
+	l_debug("swp_patches: replaced %d SWP instructions", count);
 }
 
 /* ------------------------------------------------------------------------- *
