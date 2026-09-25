@@ -13,3 +13,4 @@ repro-save/
 *.jpg
 *.json
 logs/
+*.so
