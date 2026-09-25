@@ -7,3 +7,9 @@ build/
 repro-save/
 
 .DS_Store
+*.bak
+*.png
+*.psvita-toolkit.json
+*.jpg
+*.json
+logs/
