@@ -41,6 +41,7 @@ static void savegame_patches(void);
 static void nullzone_patches(void);
 static void checkpoint_patches(void);
 static void hud_patches(void);
+static void exit_patches(void);
 
 void __kuser_memory_barrier(void) {
 	__sync_synchronize();
@@ -81,6 +82,7 @@ void so_patch(void) {
 	nullzone_patches();
 	checkpoint_patches();
 	hud_patches();
+	exit_patches();
 }
 
 /* ------------------------------------------------------------------------- *
@@ -426,4 +428,26 @@ static void hud_patches(void) {
 	uintptr_t joy = (uintptr_t)so_symbol(&so_mod, "_ZN13FlashJoystick6UpdateEv");
 	if (joy && char_set_alpha)
 		joystick_update_hook = hook_addr(joy, (uintptr_t)&joystick_update);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Quitting from the main menu
+ *
+ * The menu's exit option calls Application::SelfDestroy(), which saves and
+ * deletes the Application, and then nativeExit(), which asks Java to finish the
+ * activity. Nothing on our side answers that call, so we come back to the render
+ * loop and the next nativeRender() updates the Application that was just freed.
+ * By then the save is done, so just end the process.
+ * ------------------------------------------------------------------------- */
+static void native_exit(void) {
+	l_info("nativeExit: quitting from the game menu");
+	sceKernelExitProcess(0);
+}
+
+static void exit_patches(void) {
+	uintptr_t ne = (uintptr_t)so_symbol(&so_mod, "nativeExit");
+	if (ne)
+		hook_addr(ne, (uintptr_t)&native_exit);
+	else
+		l_error("nativeExit not found");
 }
